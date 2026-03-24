@@ -277,6 +277,19 @@ func WithRetryBackoff(fn func(attempt int) time.Duration) Option {
 		})
 }
 
+// WithRequestTimeout sets a timeout applied to each retry attempt. When greater
+// than zero, the transport clones the request with a new context and this timeout
+// at the start of each attempt (including the first), so retries get a fresh
+// deadline instead of sharing the original request's context. When zero, the
+// original request context is used as-is.
+func WithRequestTimeout(d time.Duration) Option {
+	return newOption("WithPerAttemptTimeout", fmt.Sprintf("WithPerAttemptTimeout(%s)", d),
+		func(c *Config) error {
+			c.RequestTimeout = d
+			return nil
+		})
+}
+
 // WithCompression enables gzip compression for request bodies using a pooled
 // gzip writer. An optional compression level may be provided (see the
 // compress/gzip constants, e.g. gzip.BestSpeed). When omitted, gzip.DefaultCompression

@@ -95,6 +95,10 @@ type Config struct {
 	MaxRetries   int
 	RetryBackoff func(attempt int) time.Duration
 
+	// RequestTimeout is the timeout of a single request. It is
+	// reset after each retry.
+	RequestTimeout time.Duration
+
 	// CompressRequestBody enables gzip compression for request bodies.
 	CompressRequestBody      bool
 	CompressRequestBodyLevel int
@@ -149,6 +153,7 @@ type Client struct {
 	maxRetries            int
 	retryOnError          func(*http.Request, error) bool
 	retryBackoff          func(attempt int) time.Duration
+	requestTimeout        time.Duration
 	discoverNodesInterval time.Duration
 	discoverNodeTimeout   *time.Duration
 	discoverWaitGroup     sync.WaitGroup
@@ -276,6 +281,7 @@ func New(cfg Config) (*Client, error) {
 		maxRetries:            cfg.MaxRetries,
 		retryOnError:          cfg.RetryOnError,
 		retryBackoff:          cfg.RetryBackoff,
+		requestTimeout:        cfg.RequestTimeout,
 		discoverNodesInterval: cfg.DiscoverNodesInterval,
 
 		compressRequestBody:      cfg.CompressRequestBody,
@@ -394,46 +400,63 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
 	}
 
 	originalPath := req.URL.Path
+	rctx := req.Context()
+	baseReq := req
 	for i := 0; i <= c.maxRetries; i++ {
 		var (
 			pool            ConnectionPool
 			conn            *Connection
 			shouldRetry     bool
 			shouldCloseBody bool
+			attemptReq      *http.Request
+			attemptCancel   context.CancelFunc
 		)
+
+		attemptReq = baseReq
+		if c.requestTimeout > 0 {
+			rctx, cancel := context.WithTimeout(rctx, c.requestTimeout)
+			attemptReq = baseReq.Clone(rctx)
+			attemptCancel = cancel
+		}
 
 		pool = c.snapshotPool()
 		conn, err = pool.Next()
 		if err != nil {
+			if attemptCancel != nil {
+				attemptCancel()
+			}
 			if c.logger != nil {
-				c.logRoundTrip(req, nil, err, time.Time{}, time.Duration(0))
+				c.logRoundTrip(attemptReq, nil, err, time.Time{}, time.Duration(0))
 			}
 			return nil, fmt.Errorf("cannot get connection: %s", err)
 		}
 
 		// Update request
-		c.setReqURL(conn.URL, req)
-		c.setReqAuth(conn.URL, req)
+		c.setReqURL(conn.URL, attemptReq)
+		c.setReqAuth(conn.URL, attemptReq)
 
-		if !c.disableRetry && i > 0 && req.Body != nil && req.Body != http.NoBody {
-			body, err := req.GetBody()
+		if !c.disableRetry && i > 0 && attemptReq.Body != nil && attemptReq.Body != http.NoBody {
+			body, err := baseReq.GetBody()
 			if err != nil {
+				if attemptCancel != nil {
+					attemptCancel()
+				}
 				return nil, fmt.Errorf("cannot get request body: %s", err)
 			}
-			req.Body = body
+			attemptReq.Body = body
 		}
 
 		// Set up time measures and execute the request
 		start := time.Now().UTC()
-		res, err = c.roundTrip(req)
+		res, err = c.roundTrip(attemptReq)
 		dur := time.Since(start)
 
 		// Log request and response
 		if c.logger != nil {
-			if c.logger.RequestBodyEnabled() && req.Body != nil && req.Body != http.NoBody {
-				req.Body, _ = req.GetBody()
+			if c.logger.RequestBodyEnabled() && attemptReq.Body != nil && attemptReq.Body != http.NoBody {
+				attemptReq.Body, _ = baseReq.GetBody()
 			}
-			c.logRoundTrip(req, res, err, start, dur)
+			c.logRoundTrip(attemptReq, res, err, start, dur)
 		}
 
 		if err != nil {
@@ -446,7 +469,7 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
 			_ = pool.OnFailure(conn)
 
 			// Retry upon decision by the user
-			if !c.disableRetry && (c.retryOnError == nil || c.retryOnError(req, err)) {
+			if !c.disableRetry && (c.retryOnError == nil || c.retryOnError(attemptReq, err)) {
 				shouldRetry = true
 			}
 		} else {
@@ -461,7 +484,7 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
 		}
 
 		if res != nil && c.instrumentation != nil {
-			c.instrumentation.AfterResponse(req.Context(), res)
+			c.instrumentation.AfterResponse(attemptReq.Context(), res)
 		}
 
 		// Retry on configured response statuses
@@ -472,6 +495,11 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
 					shouldCloseBody = true
 				}
 			}
+		}
+
+		// release the timeout context to avoid leaks
+		if attemptCancel != nil {
+			attemptCancel()
 		}
 
 		// Break if retry should not be performed
@@ -489,24 +517,27 @@ func (c *Client) Perform(req *http.Request) (*http.Response, error) {
 
 		// Delay the retry if a backoff function is configured
 		if c.retryBackoff != nil {
-			var cancelled bool
 			backoff := c.retryBackoff(i + 1)
-			timer := time.NewTimer(backoff)
-			select {
-			case <-req.Context().Done():
-				err = req.Context().Err()
-				cancelled = true
-				timer.Stop()
-			case <-timer.C:
-			}
-			if cancelled {
-				break
+			if backoff > 0 {
+				var cancelRetry bool
+				timer := time.NewTimer(backoff)
+				select {
+				case <-rctx.Done():
+					err = rctx.Err()
+					timer.Stop()
+				case <-timer.C:
+				}
+				if cancelRetry {
+					break
+				}
 			}
 		}
 
 		// Re-init the path of the request to its original state
 		// This will be re-enriched by the connection upon retry
-		req.URL.Path = originalPath
+		if c.requestTimeout == 0 {
+			baseReq.URL.Path = originalPath
+		}
 	}
 
 	// TODO(karmi): Wrap error
